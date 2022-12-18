@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 if [ $# -ne 2 ] 
 then
     echo "ERROR: Invalid number of arguments provided!"
@@ -9,7 +9,7 @@ searchstr=$2
 
 if [ -d $filesdir ]
 then
-    numfiles=$( ls -1q $filesdir | wc -l ) 
+    numfiles=$( ls -1 $filesdir | wc -l ) 
     numlines=$( grep -r $searchstr $filesdir | wc -l )
     echo "The number of files are $numfiles and the number of matching lines are $numlines"
     exit 0
