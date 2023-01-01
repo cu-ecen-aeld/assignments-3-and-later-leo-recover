@@ -4,6 +4,8 @@
 #include <syslog.h>
 #include <signal.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -12,17 +14,25 @@
 
 #define MYPORT "9000"  // the port users will be connecting to
 #define BACKLOG 10     // how many pending connections queue will hold
-#define MAXDATASIZE 100 // max number of bytes we can get at once 
+#define MAXDATASIZE 200 // max number of bytes we can get at once 
 
 #define FILE_PATH "/var/tmp/aesdsocketdata"
 
 int sockfd, newfd;
+FILE *f = NULL;
+char *buf = NULL;
 
 static void signal_handler(int sig_number)
 {
     int errno_saved = errno;
     syslog(LOG_INFO, "Caught signal, exiting");
-    // free(buf);
+    if (buf) {
+        free(buf);
+    }
+    if (f) {
+        fclose(f);
+    }
+    remove(FILE_PATH);
     // shutdown(sockfd);
     errno = errno_saved;
     exit(0);
@@ -42,15 +52,15 @@ int main(int argc, char *argv[])
 {
     int status, numbytes, total_len=0; 
     int init_buf=1; // flag to initialize the buffer
-    
+    pid_t pid;
+
     struct sockaddr_storage their_addr; // connector's address information
     socklen_t sin_size;
     struct addrinfo hints;
     struct addrinfo *servinfo;  // will point to the results
     char s[INET_ADDRSTRLEN];
     char buf_recv[MAXDATASIZE];
-    char *buf = NULL, *ptr = NULL;
-    FILE *f;
+    char *ptr = NULL;
     char *line = NULL;
 
     struct sigaction exit_action;
@@ -99,80 +109,103 @@ int main(int argc, char *argv[])
     }
     freeaddrinfo(servinfo);
 
-    // start listening
-    if (listen(sockfd, BACKLOG) != 0) {
-        syslog(LOG_ERR, "Listen error!");
-        exit(-1);
+    // Parse -d argument
+    if (argc == 2 && strcmp(argv[1], "-d") == 0) {
+        syslog(LOG_INFO, "Daemon mode requested... forking");
+        pid = fork();
+    } else {
+        pid = 0;
     }
 
-    // accept loop
-    while (1) {
-        syslog(LOG_DEBUG, "Waiting for the connection...");
-        sin_size = sizeof their_addr;
-        newfd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
-        if (newfd == -1) {
-            perror("accept");
-            exit(-1);
-        }
+    switch(pid) {
+        case -1:
+        break;
 
-        inet_ntop(their_addr.ss_family,
-            get_in_addr((struct sockaddr *)&their_addr),
-            s, sizeof s);
-        syslog(LOG_INFO, "Accepted connection from %s\n", s);
-
-        f = fopen(FILE_PATH, "a+");
-        if (f == NULL) {
-            perror("file open");
-            exit(-1);
-        }
-
-        // recv inner loop
-        while ((numbytes = recv(newfd, buf_recv, MAXDATASIZE-1, 0)) != 0) {
-            if (numbytes == -1) {
-                perror("recv");
+        case 0:
+            // start listening
+            if (listen(sockfd, BACKLOG) != 0) {
+                syslog(LOG_ERR, "Listen error!");
                 exit(-1);
             }
-            syslog(LOG_INFO, "Packet received: %s\n", buf_recv);
-            
-            // buffer it until we get the newline
-            total_len += numbytes;
-            syslog(LOG_DEBUG, "sizeof buf = %d\n", total_len);
-            buf = realloc(buf, total_len);
-            if (buf == NULL) {
-                perror("allocation");
-                exit(-1);
-            }
-            if (init_buf) {
-                *buf = '\0'; 
-                init_buf = 0;
-            }
-            strncat(buf, buf_recv, numbytes);
-            syslog(LOG_DEBUG, "Buffer content: %s\n", buf);
-            
-            // flush to file if \n is found
-            if ((ptr = memchr(buf, '\n', total_len))) {
-                syslog(LOG_DEBUG, "Flushing to file %ld bytes", ptr-buf+1);
-                fwrite(buf, sizeof(char), ptr-buf+1, f);
+
+            // accept loop
+            while (1) {
+                syslog(LOG_DEBUG, "Waiting for the connection...");
+                sin_size = sizeof their_addr;
+                newfd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
+                if (newfd == -1) {
+                    perror("accept");
+                    exit(-1);
+                }
+
+                inet_ntop(their_addr.ss_family,
+                    get_in_addr((struct sockaddr *)&their_addr),
+                    s, sizeof s);
+                syslog(LOG_INFO, "Accepted connection from %s\n", s);
+
+                f = fopen(FILE_PATH, "a+");
+                if (f == NULL) {
+                    perror("file open");
+                    exit(-1);
+                }
+
+                // recv inner loop
+                while ((numbytes = recv(newfd, buf_recv, MAXDATASIZE-1, 0)) != 0) {
+                    if (numbytes == -1) {
+                        perror("recv");
+                        exit(-1);
+                    }
+                    syslog(LOG_INFO, "Packet received: %s\n", buf_recv);
+                    
+                    // buffer it until we get the newline
+                    total_len += (numbytes+1);
+                    syslog(LOG_DEBUG, "sizeof buf = %d\n", total_len);
+                    buf = realloc(buf, total_len);
+                    if (buf == NULL) {
+                        perror("allocation");
+                        exit(-1);
+                    }
+                    if (init_buf) {
+                        *buf = '\0'; 
+                        init_buf = 0;
+                    }
+                    strncat(buf, buf_recv, numbytes);
+                    syslog(LOG_DEBUG, "Buffer content: %s\n", buf);
+                    
+                    // flush to file if \n is found
+                    if ((ptr = memchr(buf, '\n', total_len))) {
+                        syslog(LOG_DEBUG, "Flushing to file %ld bytes", ptr-buf+1);
+                        fwrite(buf, sizeof(char), ptr-buf+1, f);
+                        free(buf);
+                        buf = NULL;
+                        init_buf = 1;
+                        total_len = 0;
+
+                        // return the full content of the file to the client
+                        int nread; 
+                        size_t len;
+                        fseek(f, 0L, SEEK_SET);
+                        while ((nread = getline(&line, &len, f)) != -1) {
+                            syslog(LOG_DEBUG, "Sending line: %s", line);
+                            if (send(newfd, line, nread, 0) == -1) {
+                                perror("Send");
+                                exit(-1);
+                            }
+                        }
+                        free(line);
+                        line = NULL;
+                    }
+                }
+                syslog(LOG_INFO, "Closed connection from %s\n", s);
                 free(buf);
                 buf = NULL;
-                init_buf = 1;
-                total_len = 0;
-
-                // return the full content of the file to the client
-                int nread; 
-                size_t len;
-                fseek(f, 0L, SEEK_SET);
-                while ((nread = getline(&line, &len, f)) != -1) {
-                    syslog(LOG_DEBUG, "Sending line: %s", line);
-                    send(newfd, line, nread, 0);
-                }
+                fclose(f);
+                f = NULL;
             }
+        break;
 
-        }
-        syslog(LOG_INFO, "Closed connection from %s\n", s);
-        free(buf);
-        free(line);
-        fclose(f);
+        default:
+        break;
     }
-    return 0;
+    exit(EXIT_SUCCESS);
 }
