@@ -64,6 +64,10 @@ int main(int argc, char *argv[])
     char *line = NULL;
 
     struct sigaction exit_action;
+
+    // initialize the buffers
+    memset(buf_recv, 0, sizeof buf_recv);
+    memset(s, 0, sizeof s);
     
     openlog(NULL, 0, LOG_USER);
     syslog(LOG_DEBUG, "aesdsocket starting");
@@ -160,15 +164,19 @@ int main(int argc, char *argv[])
                     // buffer it until we get the newline
                     total_len += (numbytes+1);
                     syslog(LOG_DEBUG, "sizeof buf = %d\n", total_len);
-                    buf = realloc(buf, total_len);
+                    if (init_buf) {
+                        buf = malloc(total_len);
+                        memset(buf, 0, total_len);
+                        init_buf = 0;    
+                    } else {
+                        buf = realloc(buf, total_len);
+                        memset(buf + total_len - numbytes, 0, numbytes);
+                    }
                     if (buf == NULL) {
                         perror("allocation");
                         exit(-1);
                     }
-                    if (init_buf) {
-                        *buf = '\0'; 
-                        init_buf = 0;
-                    }
+                    
                     strncat(buf, buf_recv, numbytes);
                     syslog(LOG_DEBUG, "Buffer content: %s\n", buf);
                     
